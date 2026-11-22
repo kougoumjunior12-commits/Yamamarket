@@ -1,0 +1,757 @@
+yama-shop-fullstack/ ├── backend/ │ ├── .env # Clés secrètes et URL PostgreSQL │ ├── package.json # Dépendances Node.js │ ├── schema.sql # Tables, contraintes et données initiales │ └── server.js # API REST sécurisée + calculs automatiques + séquestre └── frontend/ └── index.html # Interface Yama Shop connectée à l'API (/api/...) 
+
+-- 1. Boutiques multi-vendeurs (avec pourcentage de commission de Koukoum Junior) CREATE TABLE IF NOT EXISTS stores ( id SERIAL PRIMARY KEY, name VARCHAR(120) UNIQUE NOT NULL, PORT=3000 DATABASE_URL=postgresql://utilisateur:motdepasse@localhost:5432/yamashop ADMIN_PIN=junior2026 require('dotenv').config(); const express = require('express'); const cors = require('cors'); const helmet = require('helmet'); const rateLimit = require('express-rate-limit'); const { Pool } = require('pg'); const app = express(); const pool = new Pool({ connectionString: process.env.DATABASE_URL }); const ADMIN_NAME = 'Koukoum Junior'; app.use(helmet({ contentSecurityPolicy: false })); app.use(cors()); app.use(express.json({ limit: '50kb' })); app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300 })); // Masquage automatique des coordonnées privées dans la messagerie function maskPrivateInfo(text) { return String(text || '') .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[email masqué]') .replace(/(\+?\d[\d\s\-().]{6,}\d)/g, '[numéro masqué]') .replace(/(https?:\/\/[^\s]+|www\.[^\s]+)/gi, '[lien masqué]'); } // Vérification simple du rôle Admin (Koukoum Junior) function requireAdmin(req, res, next) { const role = req.headers['x-role']; const pin = req.headers['x-admin-pin']; if (role !== 'admin' || (process.env.ADMIN_PIN && pin !== process.env.ADMIN_PIN)) { return res.status(403).json({ error: `Accès réservé à l'administrateur ${ADMIN_NAME}.` }); } next(); } // --- 1. CHARGER TOUT L'ÉTAT DE LA PLATEFORME --- app.get('/api/state', async (req, res) => { try { const [storesRes, productsRes, ordersRes, timelinesRes, convsRes, msgsRes, ticketsRes] = await Promise.all([ pool.query('SELECT * FROM stores ORDER BY id ASC'), pool.query(` SELECT p.*, s.name AS store_name FROM products p JOIN stores s ON p.store_id = s.id ORDER BY p.id DESC `), pool.query(` SELECT o.*, p.title AS product_title, s.name AS store_name FROM orders o JOIN products p ON o.product_id = p.id JOIN stores s ON o.store_id = s.id ORDER BY o.id DESC `), pool.query('SELECT * FROM parcel_timeline ORDER BY id ASC'), pool.query(` SELECT c.id, c.order_id, c.flagged, o.parcel_code, p.title AS product_title, s.name AS store_name FROM conversations c JOIN orders o ON c.order_id = o.id JOIN products p ON o.product_id = p.id JOIN stores s ON c.store_id = s.id ORDER BY c.id DESC `), pool.query('SELECT * FROM chat_messages ORDER BY id ASC'), pool.query('SELECT * FROM support_tickets ORDER BY id DESC') ]); const timelinesByOrder = {}; timelinesRes.rows.forEach(t => { if (!timelinesByOrder[t.order_id]) timelinesByOrder[t.order_id] = []; timelinesByOrder[t.order_id].push(t); }); const msgsByConv = {}; msgsRes.rows.forEach(m => { if (!msgsByConv[m.conversation_id]) msgsByConv[m.conversation_id] = []; msgsByConv[m.conversation_id].push(m); }); const orders = ordersRes.rows.map(o => ({ ...o, timeline: timelinesByOrder[o.id] || [] })); const conversations = convsRes.rows.map(c => ({ ...c, messages: msgsByConv[c.id] || [] })); res.json({ adminName: ADMIN_NAME, stores: storesRes.rows, products: productsRes.rows, orders, conversations, tickets: ticketsRes.rows }); } catch (err) { res.status(500).json({ error: err.message }); } }); // --- 2. VENDEUR : CRÉER OU METTRE À JOUR SA BOUTIQUE --- app.post('/api/stores', async (req, res) => { const { name, logistics } = req.body; if (!name || !['dropshipping', 'stock'].includes(logistics)) { return res.status(400).json({ error: 'Nom de boutique et modèle logistique requis.' }); } try { const { rows } = await pool.query( `INSERT INTO stores (name, logistics, commission_pct) VALUES ($1, $2, 12.00) ON CONFLICT (name) DO UPDATE SET logistics = EXCLUDED.logistics RETURNING *`, [String(name).trim(), logistics] ); res.status(201).json(rows[0]); } catch (err) { res.status(500).json({ error: err.message }); } }); // --- 3. VENDEUR : PUBLIER UN PRODUIT --- app.post('/api/products', async (req, res) => { const { storeId, title, category, mode, priceEur, stock, origin } = req.body; const price = Number(priceEur); const qty = Number(stock); if (!storeId || !title || !category || !['dropshipping', 'stock', 'flash'].includes(mode) || price <= 0 || qty < 0) { return res.status(400).json({ error: 'Données produit invalides.' }); } try { const { rows } = await pool.query( `INSERT INTO products (store_id, title, category, mode, price_eur, old_eur, stock, origin, emoji) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '📦') RETURNING *`, [Number(storeId), String(title).trim(), category, mode, price, Number((price * 1.35).toFixed(2)), qty, String(origin || 'International').trim()] ); res.status(201).json(rows[0]); } catch (err) { res.status(500).json({ error: err.message }); } }); // --- 4. ACHETEUR : VALIDER UNE COMMANDE (CALCUL AUTO + SÉQUESTRE) --- app.post('/api/orders', async (req, res) => { const { items, buyerCity } = req.body; if (!Array.isArray(items) || !items.length || !buyerCity) { return res.status(400).json({ error: 'Panier ou destination manquant.' }); } const client = await pool.connect(); try { await client.query('BEGIN'); for (const item of items) { const pRes = await client.query( `SELECT p.id, p.title, p.price_eur, p.stock, p.store_id, s.commission_pct FROM products p JOIN stores s ON p.store_id = s.id WHERE p.id = $1 FOR UPDATE`, [Number(item.productId)] ); const prod = pRes.rows[0]; const qty = Number(item.qty); if (!prod || prod.stock < qty) { throw new Error(`Stock insuffisant pour ${prod ? prod.title : 'ce produit'}.`); } const grossEur = Number((Number(prod.price_eur) * qty).toFixed(2)); const pct = Number(prod.commission_pct); const adminFeeEur = Number(((grossEur * pct) / 100).toFixed(2)); const sellerNetEur = Number((grossEur - adminFeeEur).toFixed(2)); const parcelCode = `CMD-${Date.now().toString().slice(-5)}-${Math.floor(10 + Math.random() * 89)}`; const ordRes = await client.query( `INSERT INTO orders (parcel_code, product_id, store_id, qty, unit_eur, gross_eur, commission_pct, admin_fee_eur, seller_net_eur, status, payout_released, buyer_city) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'placed', FALSE, $10) RETURNING id`, [parcelCode, prod.id, prod.store_id, qty, prod.price_eur, grossEur, pct, adminFeeEur, sellerNetEur, String(buyerCity).trim()] ); const orderId = ordRes.rows[0].id; await client.query( `INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Commande payée', $2)`, [orderId, `Fonds sécurisés en séquestre (${buyerCity}).`] ); const convRes = await client.query( `INSERT INTO conversations (order_id, store_id) VALUES ($1, $2) RETURNING id`, [orderId, prod.store_id] ); await client.query( `INSERT INTO chat_messages (conversation_id, sender_label, body) VALUES ($1, 'Système', $2)`, [convRes.rows[0].id, `Discussion sécurisée ouverte pour ${parcelCode} (${buyerCity}).`] ); await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [qty, prod.id]); } await client.query('COMMIT'); res.status(201).json({ success: true }); } catch (err) { await client.query('ROLLBACK'); res.status(400).json({ error: err.message }); } finally { client.release(); } }); // --- 5. VENDEUR : EXPÉDIER UN COLIS AVEC NUMÉRO DE SUIVI --- app.patch('/api/orders/:id/ship', async (req, res) => { const orderId = Number(req.params.id); const tracking = String(req.body.trackingNumber || '').trim(); if (tracking.length < 4) return res.status(400).json({ error: 'Numéro de suivi invalide.' }); const { rows } = await pool.query( `UPDATE orders SET status = 'shipped', tracking_number = $1 WHERE id = $2 AND status <> 'delivered' RETURNING id, parcel_code`, [tracking, orderId] ); if (!rows[0]) return res.status(404).json({ error: 'Commande introuvable ou déjà livrée.' }); await pool.query( `INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Expédié', $2)`, [orderId, `Pris en charge par le transporteur (Suivi : ${tracking}). Fonds toujours en séquestre.`] ); res.json({ success: true }); }); // --- 6. VENDEUR : TENTER D'ENCAISSER (BLOQUÉ TANT QUE NON LIVRÉ) --- app.post('/api/orders/:id/payout', async (req, res) => { const orderId = Number(req.params.id); const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]); const ord = rows[0]; if (!ord) return res.status(404).json({ error: 'Commande introuvable.' }); if (ord.status !== 'delivered') { return res.status(403).json({ error: 'Paiement bloqué : tant que le produit n’a pas été livré au client, le vendeur ne peut pas encaisser.' }); } if (ord.payout_released) { return res.status(409).json({ error: 'Ce montant a déjà été versé.' }); } await pool.query('UPDATE orders SET payout_released = TRUE, released_at = NOW() WHERE id = $1', [orderId]); res.json({ success: true, sellerNetEur: ord.seller_net_eur }); }); // --- 7. ADMIN (KOUKOUM JUNIOR) : CONFIRMER LA LIVRAISON --- app.patch('/api/admin/orders/:id/deliver', requireAdmin, async (req, res) => { const orderId = Number(req.params.id); const { rows } = await pool.query( `UPDATE orders SET status = 'delivered', delivered_at = NOW() WHERE id = $1 RETURNING id`, [orderId] ); if (!rows[0]) return res.status(404).json({ error: 'Commande introuvable.' }); await pool.query( `INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Livré', $2)`, [orderId, `Livraison confirmée par ${ADMIN_NAME}. Versement vendeur débloqué.`] ); res.json({ success: true }); }); // --- 8. ADMIN (KOUKOUM JUNIOR) : MODIFIER LE POURCENTAGE DE COMMISSION --- app.patch('/api/admin/stores/:id/commission', requireAdmin, async (req, res) => { const storeId = Number(req.params.id); const pct = Number(req.body.commissionPct); if (Number.isNaN(pct) || pct < 0 || pct > 80) { return res.status(400).json({ error: 'Pourcentage invalide (0 à 80%).' }); } await pool.query('UPDATE stores SET commission_pct = $1 WHERE id = $2', [pct, storeId]); res.json({ success: true }); }); // --- 9. MESSAGERIE PRIVÉE ACHETEUR <-> VENDEUR --- app.post('/api/conversations/:id/messages', async (req, res) => { const convId = Number(req.params.id); const senderLabel = String(req.body.senderLabel || 'Acheteur'); const cleanBody = maskPrivateInfo(req.body.body).trim(); if (!cleanBody) return res.status(400).json({ error: 'Message vide.' }); const { rows } = await pool.query( `INSERT INTO chat_messages (conversation_id, sender_label, body) VALUES ($1, $2, $3) RETURNING *`, [convId, senderLabel, cleanBody] ); res.status(201).json(rows[0]); }); app.post('/api/conversations/:id/flag', async (req, res) => { await pool.query('UPDATE conversations SET flagged = TRUE WHERE id = $1', [Number(req.params.id)]); res.json({ success: true }); }); // --- 10. SUPPORT ACTIF (RÉPONSE & ACTION IMMÉDIATE) --- app.post('/api/support', async (req, res) => { const { parcelCode, ticketType, description } = req.body; const code = String(parcelCode || '').trim().toUpperCase(); const ordRes = code ? await pool.query('SELECT * FROM orders WHERE parcel_code = $1', [code]) : await pool.query('SELECT * FROM orders ORDER BY id DESC LIMIT 1'); const ord = ordRes.rows[0]; let reply = `Demande enregistrée et transmise à ${ADMIN_NAME}.`; if (ord) { if (ticketType === 'payout_hold') { reply = ord.status !== 'delivered' ? `Diagnostic automatique (${ord.parcel_code}) : statut "${ord.status}". Tant que le colis n'est pas livré, votre part nette (${ord.seller_net_eur} €) reste bloquée en séquestre.` : `Colis ${ord.parcel_code} livré ! Votre gain net de ${ord.seller_net_eur} € est déblocable dans l'Espace Vendeur.`; } else if (ticketType === 'commission') { reply = `Calcul automatique (${ord.parcel_code}) : Brut = ${ord.gross_eur} € | Commission ${ADMIN_NAME} (${ord.commission_pct}%) = ${ord.admin_fee_eur} € | Net Vendeur = ${ord.seller_net_eur} €.`; } else if (ticketType === 'tracking') { const match = String(description || '').match(/\b[A-Z0-9]{6,22}\b/i); if (match && ord.status !== 'delivered') { const newTrack = match[0].toUpperCase(); await pool.query(`UPDATE orders SET tracking_number = $1, status = 'shipped' WHERE id = $2`, [newTrack, ord.id]); await pool.query(`INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Expédié', $2)`, [ord.id, `Suivi mis à jour via Support Actif : ${newTrack}`]); reply = `Numéro de suivi ${newTrack} enregistré sur ${ord.parcel_code}. Le paiement reste en séquestre jusqu'à livraison.`; } else { reply = `Suivi actuel de ${ord.parcel_code} : ${ord.tracking_number} (${ord.status}).`; } } } const { rows } = await pool.query( `INSERT INTO support_tickets (parcel_code, ticket_type, description, reply) VALUES ($1, $2, $3, $4) RETURNING *`, [ord ? ord.parcel_code : 'Général', ticketType, String(description || ''), reply] ); res.status(201).json(rows[0]); }); const PORT = process.env.PORT || 3000; app.listen(PORT, () => console.log(`Yama Shop API active sur http://localhost:${PORT}`)); logistics VARCHAR(30) NOT NULL CHECK (logistics IN ('dropshipping', 'stock')), commission_pct DECIMAL(5,2) NOT NULL DEFAULT 12.00 CHECK (commission_pct >= 0 AND commission_pct <= 80), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); -- 2. Produits (Dropshipping, Stock Vendeur, Offres Flash) CREATE TABLE IF NOT EXISTS products ( id SERIAL PRIMARY KEY, store_id INT REFERENCES stores(id) ON DELETE CASCADE, title VARCHAR(200) NOT NULL, category VARCHAR(80) NOT NULL, mode VARCHAR(30) NOT NULL CHECK (mode IN ('dropshipping', 'stock', 'flash')), price_eur DECIMAL(10,2) NOT NULL CHECK (price_eur > 0), old_eur DECIMAL(10,2), stock INT NOT NULL DEFAULT 0 CHECK (stock >= 0), origin VARCHAR(120) NOT NULL, emoji VARCHAR(16) DEFAULT '📦', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); -- 3. Commandes & Colis (Séquestre actif jusqu'à livraison) CREATE TABLE IF NOT EXISTS orders ( id SERIAL PRIMARY KEY, parcel_code VARCHAR(30) UNIQUE NOT NULL, product_id INT REFERENCES products(id), store_id INT REFERENCES stores(id), qty INT NOT NULL CHECK (qty > 0), unit_eur DECIMAL(10,2) NOT NULL, gross_eur DECIMAL(10,2) NOT NULL, commission_pct DECIMAL(5,2) NOT NULL, admin_fee_eur DECIMAL(10,2) NOT NULL, seller_net_eur DECIMAL(10,2) NOT NULL, status VARCHAR(25) NOT NULL DEFAULT 'placed' CHECK (status IN ('placed', 'shipped', 'delivered')), payout_released BOOLEAN NOT NULL DEFAULT FALSE, tracking_number VARCHAR(80) NOT NULL DEFAULT 'En attente expédition', buyer_city VARCHAR(140) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, delivered_at TIMESTAMP NULL, released_at TIMESTAMP NULL ); -- 4. Chronologie de suivi des colis CREATE TABLE IF NOT EXISTS parcel_timeline ( id SERIAL PRIMARY KEY, order_id INT REFERENCES orders(id) ON DELETE CASCADE, step_title VARCHAR(100) NOT NULL, detail TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); -- 5. Conversations & Messages (Vie privée protégée) CREATE TABLE IF NOT EXISTS conversations ( id SERIAL PRIMARY KEY, order_id INT UNIQUE REFERENCES orders(id) ON DELETE CASCADE, store_id INT REFERENCES stores(id) ON DELETE CASCADE, flagged BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); CREATE TABLE IF NOT EXISTS chat_messages ( id SERIAL PRIMARY KEY, conversation_id INT REFERENCES conversations(id) ON DELETE CASCADE, sender_label VARCHAR(80) NOT NULL, body TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); -- 6. Tickets de support actif CREATE TABLE IF NOT EXISTS support_tickets ( id SERIAL PRIMARY KEY, parcel_code VARCHAR(30), ticket_type VARCHAR(40) NOT NULL, description TEXT NOT NULL, reply TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ); -- Données de démonstration initiales INSERT INTO stores (name, logistics, commission_pct) VALUES ('Yama Global Dropship', 'dropshipping', 12.00) ON CONFLICT (name) DO NOTHING; INSERT INTO products (store_id, title, category, mode, price_eur, old_eur, stock, origin, emoji) SELECT s.id, v.title, v.category, v.mode, v.price_eur, v.old_eur, v.stock, v.origin, v.emoji FROM stores s CROSS JOIN (VALUES ('Écouteurs Sans Fil ANC Pro', 'Électronique', 'dropshipping', 29.00, 49.00, 120, 'Chine / Express Global', '🎧'), ('Lampe LED Tactile Sans Fil', 'Maison & Déco', 'flash', 18.50, 32.00, 75, 'Entrepôt International', '💡'), ('Montre Connectée Sport & Santé', 'Beauté & Sport', 'stock', 44.00, 65.00, 40, 'Stock Local Vérifié', '⌚'), ('Sacoche Bandoulière Anti-Pluie', 'Mode & Accessoires', 'dropshipping', 22.00, 35.00, 95, 'Dropshipping Direct', '🎒') ) AS v(title, category, mode, price_eur, old_eur, stock, origin, emoji) WHERE s.name = 'Yama Global Dropship' AND NOT EXISTS (SELECT 1 FROM products); cd backend npm init -y npm install express pg cors dotenv helmet express-rate-limit cd backend npm init -y npm install express pg cors dotenv helmet express-rate-limit cd backend npm init -y npm install express pg cors dotenv helmet express-rate-limit PORT=3000 DATABASE_URL=postgresql://utilisateur:motdepasse@localhost:5432/yamashop ADMIN_PIN=junior2026 require('dotenv').config(); const express = require('express'); const cors = require('cors'); const helmet = require('helmet'); const rateLimit = require('express-rate-limit'); const { Pool } = require('pg'); const app = express(); const pool = new Pool({ connectionString: process.env.DATABASE_URL }); const ADMIN_NAME = 'Koukoum Junior'; app.use(helmet({ contentSecurityPolicy: false })); app.use(cors()); app.use(express.json({ limit: '50kb' })); app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300 })); // Masquage automatique des coordonnées privées dans la messagerie function maskPrivateInfo(text) { return String(text || '') .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[email masqué]') .replace(/(\+?\d[\d\s\-().]{6,}\d)/g, '[numéro masqué]') .replace(/(https?:\/\/[^\s]+|www\.[^\s]+)/gi, '[lien masqué]'); } // Vérification simple du rôle Admin (Koukoum Junior) function requireAdmin(req, res, next) { const role = req.headers['x-role']; const pin = req.headers['x-admin-pin']; if (role !== 'admin' || (process.env.ADMIN_PIN && pin !== process.env.ADMIN_PIN)) { return res.status(403).json({ error: `Accès réservé à l'administrateur ${ADMIN_NAME}.` }); } next(); } // --- 1. CHARGER TOUT L'ÉTAT DE LA PLATEFORME --- app.get('/api/state', async (req, res) => { try { const [storesRes, productsRes, ordersRes, timelinesRes, convsRes, msgsRes, ticketsRes] = await Promise.all([ pool.query('SELECT * FROM stores ORDER BY id ASC'), pool.query(` SELECT p.*, s.name AS store_name FROM products p JOIN stores s ON p.store_id = s.id ORDER BY p.id DESC `), pool.query(` SELECT o.*, p.title AS product_title, s.name AS store_name FROM orders o JOIN products p ON o.product_id = p.id JOIN stores s ON o.store_id = s.id ORDER BY o.id DESC `), pool.query('SELECT * FROM parcel_timeline ORDER BY id ASC'), pool.query(` SELECT c.id, c.order_id, c.flagged, o.parcel_code, p.title AS product_title, s.name AS store_name FROM conversations c JOIN orders o ON c.order_id = o.id JOIN products p ON o.product_id = p.id JOIN stores s ON c.store_id = s.id ORDER BY c.id DESC `), pool.query('SELECT * FROM chat_messages ORDER BY id ASC'), pool.query('SELECT * FROM support_tickets ORDER BY id DESC') ]); const timelinesByOrder = {}; timelinesRes.rows.forEach(t => { if (!timelinesByOrder[t.order_id]) timelinesByOrder[t.order_id] = []; timelinesByOrder[t.order_id].push(t); }); const msgsByConv = {}; msgsRes.rows.forEach(m => { if (!msgsByConv[m.conversation_id]) msgsByConv[m.conversation_id] = []; msgsByConv[m.conversation_id].push(m); }); const orders = ordersRes.rows.map(o => ({ ...o, timeline: timelinesByOrder[o.id] || [] })); const conversations = convsRes.rows.map(c => ({ ...c, messages: msgsByConv[c.id] || [] })); res.json({ adminName: ADMIN_NAME, stores: storesRes.rows, products: productsRes.rows, orders, conversations, tickets: ticketsRes.rows }); } catch (err) { res.status(500).json({ error: err.message }); } }); // --- 2. VENDEUR : CRÉER OU METTRE À JOUR SA BOUTIQUE --- app.post('/api/stores', async (req, res) => { const { name, logistics } = req.body; if (!name || !['dropshipping', 'stock'].includes(logistics)) { return res.status(400).json({ error: 'Nom de boutique et modèle logistique requis.' }); } try { const { rows } = await pool.query( `INSERT INTO stores (name, logistics, commission_pct) VALUES ($1, $2, 12.00) ON CONFLICT (name) DO UPDATE SET logistics = EXCLUDED.logistics RETURNING *`, [String(name).trim(), logistics] ); res.status(201).json(rows[0]); } catch (err) { res.status(500).json({ error: err.message }); } }); // --- 3. VENDEUR : PUBLIER UN PRODUIT --- app.post('/api/products', async (req, res) => { const { storeId, title, category, mode, priceEur, stock, origin } = req.body; const price = Number(priceEur); const qty = Number(stock); if (!storeId || !title || !category || !['dropshipping', 'stock', 'flash'].includes(mode) || price <= 0 || qty < 0) { return res.status(400).json({ error: 'Données produit invalides.' }); } try { const { rows } = await pool.query( `INSERT INTO products (store_id, title, category, mode, price_eur, old_eur, stock, origin, emoji) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '📦') RETURNING *`, [Number(storeId), String(title).trim(), category, mode, price, Number((price * 1.35).toFixed(2)), qty, String(origin || 'International').trim()] ); res.status(201).json(rows[0]); } catch (err) { res.status(500).json({ error: err.message }); } }); // --- 4. ACHETEUR : VALIDER UNE COMMANDE (CALCUL AUTO + SÉQUESTRE) --- app.post('/api/orders', async (req, res) => { const { items, buyerCity } = req.body; if (!Array.isArray(items) || !items.length || !buyerCity) { return res.status(400).json({ error: 'Panier ou destination manquant.' }); } const client = await pool.connect(); try { await client.query('BEGIN'); for (const item of items) { const pRes = await client.query( `SELECT p.id, p.title, p.price_eur, p.stock, p.store_id, s.commission_pct FROM products p JOIN stores s ON p.store_id = s.id WHERE p.id = $1 FOR UPDATE`, [Number(item.productId)] ); const prod = pRes.rows[0]; const qty = Number(item.qty); if (!prod || prod.stock < qty) { throw new Error(`Stock insuffisant pour ${prod ? prod.title : 'ce produit'}.`); } const grossEur = Number((Number(prod.price_eur) * qty).toFixed(2)); const pct = Number(prod.commission_pct); const adminFeeEur = Number(((grossEur * pct) / 100).toFixed(2)); const sellerNetEur = Number((grossEur - adminFeeEur).toFixed(2)); const parcelCode = `CMD-${Date.now().toString().slice(-5)}-${Math.floor(10 + Math.random() * 89)}`; const ordRes = await client.query( `INSERT INTO orders (parcel_code, product_id, store_id, qty, unit_eur, gross_eur, commission_pct, admin_fee_eur, seller_net_eur, status, payout_released, buyer_city) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'placed', FALSE, $10) RETURNING id`, [parcelCode, prod.id, prod.store_id, qty, prod.price_eur, grossEur, pct, adminFeeEur, sellerNetEur, String(buyerCity).trim()] ); const orderId = ordRes.rows[0].id; await client.query( `INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Commande payée', $2)`, [orderId, `Fonds sécurisés en séquestre (${buyerCity}).`] ); const convRes = await client.query( `INSERT INTO conversations (order_id, store_id) VALUES ($1, $2) RETURNING id`, [orderId, prod.store_id] ); await client.query( `INSERT INTO chat_messages (conversation_id, sender_label, body) VALUES ($1, 'Système', $2)`, [convRes.rows[0].id, `Discussion sécurisée ouverte pour ${parcelCode} (${buyerCity}).`] ); await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [qty, prod.id]); } await client.query('COMMIT'); res.status(201).json({ success: true }); } catch (err) { await client.query('ROLLBACK'); res.status(400).json({ error: err.message }); } finally { client.release(); } }); // --- 5. VENDEUR : EXPÉDIER UN COLIS AVEC NUMÉRO DE SUIVI --- app.patch('/api/orders/:id/ship', async (req, res) => { const orderId = Number(req.params.id); const tracking = String(req.body.trackingNumber || '').trim(); if (tracking.length < 4) return res.status(400).json({ error: 'Numéro de suivi invalide.' }); const { rows } = await pool.query( `UPDATE orders SET status = 'shipped', tracking_number = $1 WHERE id = $2 AND status <> 'delivered' RETURNING id, parcel_code`, [tracking, orderId] ); if (!rows[0]) return res.status(404).json({ error: 'Commande introuvable ou déjà livrée.' }); await pool.query( `INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Expédié', $2)`, [orderId, `Pris en charge par le transporteur (Suivi : ${tracking}). Fonds toujours en séquestre.`] ); res.json({ success: true }); }); // --- 6. VENDEUR : TENTER D'ENCAISSER (BLOQUÉ TANT QUE NON LIVRÉ) --- app.post('/api/orders/:id/payout', async (req, res) => { const orderId = Number(req.params.id); const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]); const ord = rows[0]; if (!ord) return res.status(404).json({ error: 'Commande introuvable.' }); if (ord.status !== 'delivered') { return res.status(403).json({ error: 'Paiement bloqué : tant que le produit n’a pas été livré au client, le vendeur ne peut pas encaisser.' }); } if (ord.payout_released) { return res.status(409).json({ error: 'Ce montant a déjà été versé.' }); } await pool.query('UPDATE orders SET payout_released = TRUE, released_at = NOW() WHERE id = $1', [orderId]); res.json({ success: true, sellerNetEur: ord.seller_net_eur }); }); // --- 7. ADMIN (KOUKOUM JUNIOR) : CONFIRMER LA LIVRAISON --- app.patch('/api/admin/orders/:id/deliver', requireAdmin, async (req, res) => { const orderId = Number(req.params.id); const { rows } = await pool.query( `UPDATE orders SET status = 'delivered', delivered_at = NOW() WHERE id = $1 RETURNING id`, [orderId] ); if (!rows[0]) return res.status(404).json({ error: 'Commande introuvable.' }); await pool.query( `INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Livré', $2)`, [orderId, `Livraison confirmée par ${ADMIN_NAME}. Versement vendeur débloqué.`] ); res.json({ success: true }); }); // --- 8. ADMIN (KOUKOUM JUNIOR) : MODIFIER LE POURCENTAGE DE COMMISSION --- app.patch('/api/admin/stores/:id/commission', requireAdmin, async (req, res) => { const storeId = Number(req.params.id); const pct = Number(req.body.commissionPct); if (Number.isNaN(pct) || pct < 0 || pct > 80) { return res.status(400).json({ error: 'Pourcentage invalide (0 à 80%).' }); } await pool.query('UPDATE stores SET commission_pct = $1 WHERE id = $2', [pct, storeId]); res.json({ success: true }); }); // --- 9. MESSAGERIE PRIVÉE ACHETEUR <-> VENDEUR --- app.post('/api/conversations/:id/messages', async (req, res) => { const convId = Number(req.params.id); const senderLabel = String(req.body.senderLabel || 'Acheteur'); const cleanBody = maskPrivateInfo(req.body.body).trim(); if (!cleanBody) return res.status(400).json({ error: 'Message vide.' }); const { rows } = await pool.query( `INSERT INTO chat_messages (conversation_id, sender_label, body) VALUES ($1, $2, $3) RETURNING *`, [convId, senderLabel, cleanBody] ); res.status(201).json(rows[0]); }); app.post('/api/conversations/:id/flag', async (req, res) => { await pool.query('UPDATE conversations SET flagged = TRUE WHERE id = $1', [Number(req.params.id)]); res.json({ success: true }); }); // --- 10. SUPPORT ACTIF (RÉPONSE & ACTION IMMÉDIATE) --- app.post('/api/support', async (req, res) => { const { parcelCode, ticketType, description } = req.body; const code = String(parcelCode || '').trim().toUpperCase(); const ordRes = code ? await pool.query('SELECT * FROM orders WHERE parcel_code = $1', [code]) : await pool.query('SELECT * FROM orders ORDER BY id DESC LIMIT 1'); const ord = ordRes.rows[0]; let reply = `Demande enregistrée et transmise à ${ADMIN_NAME}.`; if (ord) { if (ticketType === 'payout_hold') { reply = ord.status !== 'delivered' ? `Diagnostic automatique (${ord.parcel_code}) : statut "${ord.status}". Tant que le colis n'est pas livré, votre part nette (${ord.seller_net_eur} €) reste bloquée en séquestre.` : `Colis ${ord.parcel_code} livré ! Votre gain net de ${ord.seller_net_eur} € est déblocable dans l'Espace Vendeur.`; } else if (ticketType === 'commission') { reply = `Calcul automatique (${ord.parcel_code}) : Brut = ${ord.gross_eur} € | Commission ${ADMIN_NAME} (${ord.commission_pct}%) = ${ord.admin_fee_eur} € | Net Vendeur = ${ord.seller_net_eur} €.`; } else if (ticketType === 'tracking') { const match = String(description || '').match(/\b[A-Z0-9]{6,22}\b/i); if (match && ord.status !== 'delivered') { const newTrack = match[0].toUpperCase(); await pool.query(`UPDATE orders SET tracking_number = $1, status = 'shipped' WHERE id = $2`, [newTrack, ord.id]); await pool.query(`INSERT INTO parcel_timeline (order_id, step_title, detail) VALUES ($1, 'Expédié', $2)`, [ord.id, `Suivi mis à jour via Support Actif : ${newTrack}`]); reply = `Numéro de suivi ${newTrack} enregistré sur ${ord.parcel_code}. Le paiement reste en séquestre jusqu'à livraison.`; } else { reply = `Suivi actuel de ${ord.parcel_code} : ${ord.tracking_number} (${ord.status}).`; } } } const { rows } = await pool.query( `INSERT INTO support_tickets (parcel_code, ticket_type, description, reply) VALUES ($1, $2, $3, $4) RETURNING *`, [ord ? ord.parcel_code : 'Général', ticketType, String(description || ''), reply] ); res.status(201).json(rows[0]); }); const PORT = process.env.PORT || 3000; app.listen(PORT, () => console.log(`Yama Shop API active sur http://localhost:${PORT}`)); 
+
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yama Shop — Marketplace Internationale & Dropshipping</title>
+    <style>
+        :root {
+            --navy: #131921; --navy-light: #232f3e; --orange: #ff9900; --orange-hover: #f08804;
+            --bg: #eef1f5; --card: #ffffff; --text: #0f172a; --muted: #64748b;
+            --success: #16a34a; --warn: #d97706; --border: #e2e8f0;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, Arial, sans-serif; }
+        body { background: var(--bg); color: var(--text); }
+        header {
+            background: var(--navy); color: #fff; padding: 12px 22px;
+            display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+            position: sticky; top: 0; z-index: 50;
+        }
+        .brand { cursor: pointer; display: flex; align-items: baseline; gap: 8px; }
+        .brand-name { font-size: 25px; font-weight: 800; color: var(--orange); }
+        .brand-name span { color: #fff; }
+        .search-box { display: flex; flex: 1; min-width: 240px; max-width: 620px; background: #fff; border-radius: 6px; overflow: hidden; }
+        .search-box select { border: none; background: #f1f5f9; padding: 0 10px; font-size: 13px; border-right: 1px solid var(--border); }
+        .search-box input { flex: 1; border: none; padding: 10px 12px; font-size: 14px; outline: none; }
+        .search-box button { background: var(--orange); border: none; padding: 0 16px; font-weight: 700; cursor: pointer; }
+        .header-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .header-controls select, .header-controls button {
+            padding: 8px 11px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2);
+            background: var(--navy-light); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+        }
+        .btn-cart { background: var(--orange) !important; color: #111 !important; border: none !important; font-weight: 800 !important; }
+        .subbar {
+            background: var(--navy-light); color: #fff; padding: 8px 22px;
+            display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; font-size: 13px;
+        }
+        .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+        .tab-btn { background: transparent; color: #e2e8f0; border: none; padding: 7px 12px; border-radius: 5px; cursor: pointer; font-weight: 600; }
+        .tab-btn.active { background: var(--orange); color: #111; font-weight: 700; }
+        .container { max-width: 1340px; margin: 18px auto 40px; padding: 0 18px; }
+        .section { display: none; }
+        .section.active { display: block; }
+        .filter-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+        .chip { background: #fff; border: 1px solid var(--border); padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer; }
+        .chip.active { background: var(--navy); color: #fff; border-color: var(--navy); }
+        .products-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 16px; }
+        .card { background: var(--card); border-radius: 8px; padding: 16px; box-shadow: 0 2px 6px rgba(15,23,42,0.05); border: 1px solid var(--border); }
+        .product-card { display: flex; flex-direction: column; justify-content: space-between; gap: 10px; }
+        .product-thumb { height: 140px; background: #f8fafc; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 46px; }
+        .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+        .b-drop { background: #ffedd5; color: #9a3412; }
+        .b-stock { background: #e0f2fe; color: #075985; }
+        .b-flash { background: #fee2e2; color: #991b1b; }
+        .b-held { background: #fef3c7; color: #92400e; }
+        .b-delivered { background: #dcfce7; color: #166534; }
+        .b-shipped { background: #e0e7ff; color: #3730a3; }
+        .price-main { font-size: 20px; font-weight: 800; color: #b91c1c; }
+        .price-old { font-size: 12px; color: var(--muted); text-decoration: line-through; margin-left: 6px; }
+        .btn-primary { width: 100%; background: var(--orange); color: #111; border: none; padding: 10px; border-radius: 8px; font-weight: 700; cursor: pointer; }
+        .btn-dark { background: var(--navy); color: #fff; border: none; padding: 7px 11px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }
+        .btn-green { background: var(--success); color: #fff; border: none; padding: 7px 11px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-green:disabled { background: #cbd5e1; color: #64748b; cursor: not-allowed; }
+        .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 18px; }
+        .kpi small { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+        .kpi strong { font-size: 21px; }
+        .two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; margin-bottom: 18px; }
+        input, select { width: 100%; padding: 9px 11px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; margin-bottom: 10px; }
+        .table-wrap { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 10px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+        th { background: #f8fafc; font-weight: 700; }
+        .escrow-banner { background: #fffbeb; border-left: 4px solid var(--warn); padding: 12px 14px; border-radius: 6px; font-size: 13px; color: #78350f; margin-bottom: 16px; }
+        .chat-grid { display: grid; grid-template-columns: 290px 1fr; gap: 16px; min-height: 420px; }
+        @media (max-width: 800px) { .chat-grid { grid-template-columns: 1fr; } }
+        .conv-item { padding: 10px; border-radius: 6px; border: 1px solid var(--border); margin-bottom: 8px; cursor: pointer; }
+        .conv-item.active { border-color: var(--orange); background: #fffbeb; }
+        .chat-msgs { height: 340px; overflow-y: auto; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+        .bubble { max-width: 75%; padding: 9px 12px; border-radius: 10px; font-size: 13px; }
+        .bubble.me { align-self: flex-end; background: var(--navy); color: #fff; }
+        .bubble.other { align-self: flex-start; background: #fff; border: 1px solid var(--border); }
+        .modal { display: none; position: fixed; inset: 0; background: rgba(15,23,42,0.65); z-index: 100; justify-content: center; align-items: center; padding: 16px; }
+        .modal.open { display: flex; }
+        .modal-card { background: #fff; border-radius: 10px; padding: 22px; width: 100%; max-width: 520px; max-height: 88vh; overflow-y: auto; }
+        .step-line { border-left: 2px solid var(--orange); padding-left: 12px; margin-bottom: 10px; font-size: 13px; }
+        .notice-box { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; padding: 10px; border-radius: 6px; font-size: 13px; margin-top: 8px; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="brand" onclick="switchTab('market')">
+            <div class="brand-name">Yama<span>Shop</span></div>
+        </div>
+
+        <div class="search-box">
+            <select id="catSelect" onchange="renderMarket()">
+                <option value="all">Toutes catégories</option>
+                <option value="Électronique">Électronique</option>
+                <option value="Maison & Déco">Maison & Déco</option>
+                <option value="Mode & Accessoires">Mode & Accessoires</option>
+                <option value="Beauté & Sport">Beauté & Sport</option>
+            </select>
+            <input type="text" id="searchInput" placeholder="Rechercher sur Yama Shop..." oninput="renderMarket()">
+            <button onclick="renderMarket()">Rechercher</button>
+        </div>
+
+        <div class="header-controls">
+            <select id="currencySelect" onchange="changeCurrency()">
+                <option value="MAD">🇲🇦 MAD (DH)</option>
+                <option value="EUR">🇪🇺 EUR (€)</option>
+                <option value="USD">🇺🇸 USD ($)</option>
+                <option value="GBP">🇬🇧 GBP (£)</option>
+                <option value="CAD">🇨🇦 CAD ($)</option>
+                <option value="XOF">🌍 XOF (CFA)</option>
+            </select>
+            <select id="roleSelect" onchange="switchRole()">
+                <option value="buyer">Mode : Acheteur</option>
+                <option value="seller">Mode : Vendeur</option>
+                <option value="admin">Mode : Koukoum Junior (Admin)</option>
+            </select>
+            <button class="btn-cart" onclick="openCart()">🛒 Panier (<span id="cartBadge">0</span>)</button>
+        </div>
+    </header>
+
+    <div class="subbar">
+        <div class="tabs">
+            <button class="tab-btn active" id="tab-market" onclick="switchTab('market')">Boutique</button>
+            <button class="tab-btn" id="tab-seller" onclick="switchTab('seller')">Espace Vendeur</button>
+            <button class="tab-btn" id="tab-messages" onclick="switchTab('messages')">Messagerie</button>
+            <button class="tab-btn" id="tab-support" onclick="switchTab('support')">Support Actif</button>
+            <button class="tab-btn" id="tab-admin" onclick="switchTab('admin')">Bilan Koukoum Junior</button>
+        </div>
+        <div>Base de données PostgreSQL connectée • Direction : <strong>Koukoum Junior</strong></div>
+    </div>
+
+    <main class="container">
+        <!-- 1. BOUTIQUE -->
+        <section class="section active" id="sec-market">
+            <div class="filter-row">
+                <button class="chip active" onclick="setModeFilter('all', this)">Tous</button>
+                <button class="chip" onclick="setModeFilter('dropshipping', this)">Dropshipping</button>
+                <button class="chip" onclick="setModeFilter('stock', this)">Stock Vendeur</button>
+                <button class="chip" onclick="setModeFilter('flash', this)">Ventes Flash</button>
+            </div>
+            <div class="products-grid" id="marketGrid"></div>
+        </section>
+
+        <!-- 2. ESPACE VENDEUR -->
+        <section class="section" id="sec-seller">
+            <div class="escrow-banner">
+                <strong>Séquestre obligatoire :</strong> Tant que la livraison n'est pas confirmée par <strong>Koukoum Junior</strong>, le bouton <strong>Encaisser</strong> reste bloqué.
+            </div>
+            <div class="kpi-grid" id="sellerKpis"></div>
+
+            <div class="two-col">
+                <div class="card">
+                    <h3>Ouvrir / Mettre à jour une boutique</h3>
+                    <form onsubmit="saveStore(event)">
+                        <input type="text" id="storeNameInput" placeholder="Nom de votre boutique" required>
+                        <select id="storeLogisticsInput">
+                            <option value="dropshipping">Dropshipping International</option>
+                            <option value="stock">Stock Propre</option>
+                        </select>
+                        <button type="submit" class="btn-primary">Enregistrer la boutique</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h3>Ajouter un produit</h3>
+                    <form onsubmit="publishProduct(event)">
+                        <select id="prodStoreSelect"></select>
+                        <input type="text" id="prodTitleInput" placeholder="Titre du produit" required>
+                        <select id="prodCatInput">
+                            <option value="Électronique">Électronique</option>
+                            <option value="Maison & Déco">Maison & Déco</option>
+                            <option value="Mode & Accessoires">Mode & Accessoires</option>
+                            <option value="Beauté & Sport">Beauté & Sport</option>
+                        </select>
+                        <select id="prodModeInput">
+                            <option value="dropshipping">Dropshipping</option>
+                            <option value="stock">Stock Vendeur</option>
+                            <option value="flash">Vente Flash</option>
+                        </select>
+                        <input type="number" step="0.01" min="1" id="prodPriceInput" placeholder="Prix de base (EUR)" required>
+                        <input type="number" min="1" id="prodStockInput" placeholder="Quantité en stock" required>
+                        <input type="text" id="prodOriginInput" placeholder="Pays / Entrepôt d'expédition" required>
+                        <button type="submit" class="btn-primary">Publier le produit</button>
+                    </form>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Commandes & Versements Vendeur</h3>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Colis</th><th>Boutique / Produit</th><th>Brut</th><th>Commission Junior</th><th>Net Vendeur</th><th>Livraison</th><th>Versement</th><th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sellerOrdersBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. MESSAGERIE -->
+        <section class="section" id="sec-messages">
+            <div class="card">
+                <h3>Messagerie Sécurisée Acheteur ↔ Vendeur (Contacts privés masqués)</h3>
+                <div class="chat-grid" style="margin-top:12px;">
+                    <div id="convList"></div>
+                    <div>
+                        <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                            <strong id="activeConvLabel">Sélectionnez une discussion</strong>
+                            <button class="btn-dark" id="flagConvBtn" style="display:none;" onclick="flagCurrentConv()">Signaler à Junior</button>
+                        </div>
+                        <div class="chat-msgs" id="chatMsgs"></div>
+                        <form onsubmit="sendChatMsg(event)" style="display:flex;gap:8px;">
+                            <input type="text" id="chatInput" placeholder="Votre message..." style="margin:0;" required>
+                            <button type="submit" class="btn-primary" style="width:auto;padding:0 18px;">Envoyer</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 4. SUPPORT ACTIF -->
+        <section class="section" id="sec-support">
+            <div class="two-col">
+                <div class="card">
+                    <h3>Support Actif & Résolution Immédiate</h3>
+                    <form onsubmit="submitSupportTicket(event)">
+                        <select id="ticketType">
+                            <option value="payout_hold">Paiement bloqué avant livraison</option>
+                            <option value="commission">Vérification calcul commission</option>
+                            <option value="tracking">Problème numéro de suivi</option>
+                        </select>
+                        <input type="text" id="ticketParcelId" placeholder="Code colis (ex: CMD-12345-67)">
+                        <input type="text" id="ticketDesc" placeholder="Décrivez le problème ou collez un numéro de suivi..." required>
+                        <button type="submit" class="btn-primary">Analyser maintenant</button>
+                    </form>
+                    <div id="supportLiveBox"></div>
+                </div>
+                <div class="card">
+                    <h3>Historique des résolutions</h3>
+                    <div id="ticketsHistory"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 5. ADMIN — KOUKOUM JUNIOR -->
+        <section class="section" id="sec-admin">
+            <div class="escrow-banner">
+                <strong>Tableau de Bord Administrateur — Koukoum Junior :</strong> Bilan automatique des revenus, ajustement des commissions par boutique et confirmation de livraison pour débloquer les vendeurs.
+            </div>
+            <div class="kpi-grid" id="adminKpis"></div>
+
+            <div class="card" style="margin-bottom:18px;">
+                <h3>Bilan Automatique par Boutique</h3>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr><th>Boutique</th><th>Modèle</th><th>Commission (%)</th><th>CA Brut</th><th>Bénéfice Junior</th><th>Séquestre (Non livré)</th><th>Débloqué (Livré)</th><th>Action</th></tr>
+                        </thead>
+                        <tbody id="adminStoresBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Suivi Colis & Confirmation de Livraison</h3>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr><th>Colis</th><th>Boutique</th><th>Produit</th><th>Suivi</th><th>État</th><th>Paiement</th><th>Actions</th></tr>
+                        </thead>
+                        <tbody id="adminParcelsBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- MODALE PANIER -->
+    <div class="modal" id="cartModal">
+        <div class="modal-card">
+            <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
+                <h3>Panier Yama Shop</h3>
+                <button class="btn-dark" onclick="closeModal('cartModal')">Fermer</button>
+            </div>
+            <div id="cartItemsList"></div>
+            <div style="margin:12px 0;font-weight:800;">Total : <span id="cartTotalDisplay">0.00</span></div>
+            <form onsubmit="placeOrder(event)">
+                <input type="text" id="buyerCityInput" placeholder="Ville et pays de livraison (ex: Agadir, Maroc)" required>
+                <button type="submit" class="btn-primary">Valider la commande</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODALE SUIVI -->
+    <div class="modal" id="trackModal">
+        <div class="modal-card">
+            <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
+                <h3 id="trackModalTitle">Suivi Colis</h3>
+                <button class="btn-dark" onclick="closeModal('trackModal')">Fermer</button>
+            </div>
+            <div id="trackModalBody"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:3000/api';
+        const CURRENCIES = {
+            MAD: { symbol: 'MAD', rate: 10.8 },
+            EUR: { symbol: '€', rate: 1 },
+            USD: { symbol: '$', rate: 1.09 },
+            GBP: { symbol: '£', rate: 0.85 },
+            CAD: { symbol: 'CAD', rate: 1.48 },
+            XOF: { symbol: 'CFA', rate: 655.96 }
+        };
+
+        let currency = 'MAD';
+        let activeModeFilter = 'all';
+        let currentRole = 'buyer';
+        let adminPin = '';
+        let activeConvId = null;
+
+        let db = { adminName: 'Koukoum Junior', stores: [], products: [], orders: [], conversations: [], tickets: [] };
+        let cart = JSON.parse(localStorage.getItem('yama_cart') || '[]');
+
+        function formatMoney(eur) {
+            const c = CURRENCIES[currency];
+            return `${(Number(eur) * c.rate).toFixed(2)} ${c.symbol}`;
+        }
+
+        async function syncFromServer() {
+            const res = await fetch(`${API_URL}/state`);
+            if (!res.ok) return;
+            db = await res.json();
+            refreshAllViews();
+        }
+
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            document.getElementById(`tab-${tab}`).classList.add('active');
+            document.getElementById(`sec-${tab}`).classList.add('active');
+            refreshAllViews();
+        }
+
+        function switchRole() {
+            const chosen = document.getElementById('roleSelect').value;
+            if (chosen === 'admin' && !adminPin) {
+                const entered = prompt('Code PIN Administrateur (Koukoum Junior) :', 'junior2026');
+                if (!entered) {
+                    document.getElementById('roleSelect').value = currentRole;
+                    return;
+                }
+                adminPin = entered;
+            }
+            currentRole = chosen;
+            if (currentRole === 'seller') switchTab('seller');
+            else if (currentRole === 'admin') switchTab('admin');
+            else switchTab('market');
+        }
+
+        function changeCurrency() {
+            currency = document.getElementById('currencySelect').value;
+            refreshAllViews();
+        }
+
+        function setModeFilter(mode, btn) {
+            activeModeFilter = mode;
+            document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+            btn.classList.add('active');
+            renderMarket();
+        }
+
+        function renderMarket() {
+            const q = document.getElementById('searchInput').value.trim().toLowerCase();
+            const cat = document.getElementById('catSelect').value;
+            const filtered = db.products.filter(p => {
+                const okCat = cat === 'all' || p.category === cat;
+                const okMode = activeModeFilter === 'all' || p.mode === activeModeFilter;
+                const okQ = !q || p.title.toLowerCase().includes(q) || p.store_name.toLowerCase().includes(q);
+                return okCat && okMode && okQ;
+            });
+
+            document.getElementById('marketGrid').innerHTML = filtered.map(p => {
+                const bClass = p.mode === 'dropshipping' ? 'b-drop' : p.mode === 'flash' ? 'b-flash' : 'b-stock';
+                const bLabel = p.mode === 'dropshipping' ? 'Dropshipping' : p.mode === 'flash' ? 'Vente Flash' : 'Stock';
+                return `
+                    <div class="card product-card">
+                        <div>
+                            <div class="product-thumb">${p.emoji || '📦'}</div>
+                            <div style="display:flex;justify-content:space-between;margin:8px 0 4px;">
+                                <span class="badge ${bClass}">${bLabel}</span>
+                                <span style="font-size:11px;color:var(--muted);">Stock: ${p.stock}</span>
+                            </div>
+                            <div style="font-size:12px;color:var(--muted);">Boutique : <strong>${esc(p.store_name)}</strong></div>
+                            <div style="font-size:12px;color:var(--muted);">✈️ ${esc(p.origin)}</div>
+                            <div style="font-weight:700;margin-top:6px;">${esc(p.title)}</div>
+                        </div>
+                        <div>
+                            <div>
+                                <span class="price-main">${formatMoney(p.price_eur)}</span>
+                                ${p.old_eur ? `<span class="price-old">${formatMoney(p.old_eur)}</span>` : ''}
+                            </div>
+                            <button class="btn-primary" style="margin-top:8px;" onclick="addToCart(${p.id})">Ajouter au panier</button>
+                        </div>
+                    </div>
+                `;
+            }).join('') || '<div class="card">Aucun produit disponible.</div>';
+        }
+
+        function addToCart(productId) {
+            const p = db.products.find(x => x.id === productId);
+            if (!p || p.stock <= 0) return alert('Rupture de stock.');
+            const item = cart.find(i => i.productId === productId);
+            if (item) item.qty += 1;
+            else cart.push({ productId, qty: 1 });
+            localStorage.setItem('yama_cart', JSON.stringify(cart));
+            updateCartBadge();
+        }
+
+        function updateCartBadge() {
+            document.getElementById('cartBadge').innerText = cart.reduce((s, i) => s + i.qty, 0);
+        }
+
+        function openCart() {
+            let totalEur = 0;
+            document.getElementById('cartItemsList').innerHTML = cart.map(i => {
+                const p = db.products.find(x => x.id === i.productId);
+                if (!p) return '';
+                const line = Number(p.price_eur) * i.qty;
+                totalEur += line;
+                return `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
+                    <span><strong>${esc(p.title)}</strong> × ${i.qty}</span><strong>${formatMoney(line)}</strong>
+                </div>`;
+            }).join('') || '<p style="font-size:13px;color:var(--muted);">Panier vide.</p>';
+            document.getElementById('cartTotalDisplay').innerText = formatMoney(totalEur);
+            document.getElementById('cartModal').classList.add('open');
+        }
+
+        async function placeOrder(e) {
+            e.preventDefault();
+            if (!cart.length) return alert('Panier vide.');
+            const res = await fetch(`${API_URL}/orders`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ items: cart, buyerCity: document.getElementById('buyerCityInput').value })
+            });
+            const data = await res.json();
+            if (!res.ok) return alert(data.error);
+            cart = [];
+            localStorage.setItem('yama_cart', '[]');
+            updateCartBadge();
+            closeModal('cartModal');
+            alert('Commande validée en base de données ! Fonds bloqués en séquestre jusqu’à la livraison.');
+            await syncFromServer();
+        }
+
+        async function saveStore(e) {
+            e.preventDefault();
+            const res = await fetch(`${API_URL}/stores`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: document.getElementById('storeNameInput').value,
+                    logistics: document.getElementById('storeLogisticsInput').value
+                })
+            });
+            const data = await res.json();
+            if (!res.ok) return alert(data.error);
+            e.target.reset();
+            await syncFromServer();
+            alert('Boutique enregistrée.');
+        }
+
+        async function publishProduct(e) {
+            e.preventDefault();
+            const res = await fetch(`${API_URL}/products`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    storeId: document.getElementById('prodStoreSelect').value,
+                    title: document.getElementById('prodTitleInput').value,
+                    category: document.getElementById('prodCatInput').value,
+                    mode: document.getElementById('prodModeInput').value,
+                    priceEur: document.getElementById('prodPriceInput').value,
+                    stock: document.getElementById('prodStockInput').value,
+                    origin: document.getElementById('prodOriginInput').value
+                })
+            });
+            const data = await res.json();
+            if (!res.ok) return alert(data.error);
+            e.target.reset();
+            await syncFromServer();
+            alert('Produit publié sur Yama Shop.');
+        }
+
+        async function shipParcel(orderId) {
+            const trackingNumber = prompt('Numéro de suivi du colis :', `YM${Math.floor(10000000 + Math.random() * 90000000)}`);
+            if (!trackingNumber) return;
+            const res = await fetch(`${API_URL}/orders/${orderId}/ship`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ trackingNumber })
+            });
+            if (!res.ok) return alert((await res.json()).error);
+            await syncFromServer();
+        }
+
+        async function claimSellerPayout(orderId) {
+            const res = await fetch(`${API_URL}/orders/${orderId}/payout`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) return alert(data.error);
+            alert(`Versement effectué : ${formatMoney(data.sellerNetEur)}`);
+            await syncFromServer();
+        }
+
+        async function confirmDeliveryAdmin(orderId) {
+            const res = await fetch(`${API_URL}/admin/orders/${orderId}/deliver`, {
+                method: 'PATCH',
+                headers: { 'x-role': 'admin', 'x-admin-pin': adminPin }
+            });
+            const data = await res.json();
+            if (!res.ok) return alert(data.error);
+            await syncFromServer();
+        }
+
+        async function editStoreCommission(storeId, currentPct) {
+            const val = prompt(`Nouveau pourcentage de commission pour ${db.adminName} (%) :`, currentPct);
+            if (val === null) return;
+            const res = await fetch(`${API_URL}/admin/stores/${storeId}/commission`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', 'x-role': 'admin', 'x-admin-pin': adminPin },
+                body: JSON.stringify({ commissionPct: Number(val) })
+            });
+            const data = await res.json();
+            if (!res.ok) return alert(data.error);
+            await syncFromServer();
+        }
+
+        function renderSellerView() {
+            document.getElementById('prodStoreSelect').innerHTML = db.stores.map(s =>
+                `<option value="${s.id}">${esc(s.name)} (${esc(s.logistics)})</option>`
+            ).join('');
+
+            let gross = 0, admin = 0, held = 0, unlocked = 0;
+            db.orders.forEach(o => {
+                gross += Number(o.gross_eur);
+                admin += Number(o.admin_fee_eur);
+                if (o.status !== 'delivered') held += Number(o.seller_net_eur);
+                else unlocked += Number(o.seller_net_eur);
+            });
+
+            document.getElementById('sellerKpis').innerHTML = `
+                <div class="card kpi"><small>Ventes Brutes</small><strong>${formatMoney(gross)}</strong></div>
+                <div class="card kpi"><small>Commission ${db.adminName}</small><strong>${formatMoney(admin)}</strong></div>
+                <div class="card kpi"><small>En Séquestre (Non livré)</small><strong style="color:var(--warn);">${formatMoney(held)}</strong></div>
+                <div class="card kpi"><small>Débloqué (Livré)</small><strong style="color:var(--success);">${formatMoney(unlocked)}</strong></div>
+            `;
+
+            document.getElementById('sellerOrdersBody').innerHTML = db.orders.map(o => {
+                const delivered = o.status === 'delivered';
+                return `
+                    <tr>
+                        <td><strong>${esc(o.parcel_code)}</strong><br><small>${esc(o.tracking_number)}</small></td>
+                        <td><strong>${esc(o.store_name)}</strong><br>${esc(o.product_title)} × ${o.qty}</td>
+                        <td>${formatMoney(o.gross_eur)}</td>
+                        <td>${formatMoney(o.admin_fee_eur)} (${o.commission_pct}%)</td>
+                        <td><strong>${formatMoney(o.seller_net_eur)}</strong></td>
+                        <td><span class="badge ${delivered ? 'b-delivered' : 'b-shipped'}">${delivered ? 'Livré' : o.status}</span></td>
+                        <td><span class="badge ${o.payout_released || delivered ? 'b-delivered' : 'b-held'}">${o.payout_released ? 'Versé' : delivered ? 'Déblocable' : 'Bloqué'}</span></td>
+                        <td style="display:flex;gap:6px;flex-wrap:wrap;">
+                            <button class="btn-dark" onclick="openTracking(${o.id})">Suivi</button>
+                            ${!delivered ? `<button class="btn-dark" onclick="shipParcel(${o.id})">Expédier</button>` : ''}
+                            <button class="btn-green" ${(!delivered || o.payout_released) ? 'disabled' : ''} onclick="claimSellerPayout(${o.id})">
+                                ${o.payout_released ? 'Payé' : delivered ? 'Encaisser' : 'Bloqué'}
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderAdminView() {
+            let gmv = 0, profit = 0, held = 0, released = 0;
+            db.orders.forEach(o => {
+                gmv += Number(o.gross_eur);
+                profit += Number(o.admin_fee_eur);
+                if (o.status !== 'delivered') held += Number(o.seller_net_eur);
+                else released += Number(o.seller_net_eur);
+            });
+
+            document.getElementById('adminKpis').innerHTML = `
+                <div class="card kpi"><small>Volume Total Yama Shop</small><strong>${formatMoney(gmv)}</strong></div>
+                <div class="card kpi"><small>Bénéfice Net ${db.adminName}</small><strong style="color:var(--success);">${formatMoney(profit)}</strong></div>
+                <div class="card kpi"><small>Séquestre (Non livré)</small><strong style="color:var(--warn);">${formatMoney(held)}</strong></div>
+                <div class="card kpi"><small>Débloqué (Livré)</small><strong>${formatMoney(released)}</strong></div>
+            `;
+
+            document.getElementById('adminStoresBody').innerHTML = db.stores.map(s => {
+                const sOrders = db.orders.filter(o => o.store_id === s.id);
+                const sGross = sOrders.reduce((sum, o) => sum + Number(o.gross_eur), 0);
+                const sAdmin = sOrders.reduce((sum, o) => sum + Number(o.admin_fee_eur), 0);
+                const sHeld = sOrders.filter(o => o.status !== 'delivered').reduce((sum, o) => sum + Number(o.seller_net_eur), 0);
+                const sDone = sOrders.filter(o => o.status === 'delivered').reduce((sum, o) => sum + Number(o.seller_net_eur), 0);
+
+                return `
+                    <tr>
+                        <td><strong>${esc(s.name)}</strong></td>
+                        <td>${esc(s.logistics)}</td>
+                        <td><strong>${s.commission_pct}%</strong></td>
+                        <td>${formatMoney(sGross)}</td>
+                        <td style="color:var(--success);font-weight:700;">${formatMoney(sAdmin)}</td>
+                        <td>${formatMoney(sHeld)}</td>
+                        <td>${formatMoney(sDone)}</td>
+                        <td><button class="btn-dark" onclick="editStoreCommission(${s.id}, ${s.commission_pct})">Modifier %</button></td>
+                    </tr>
+                `;
+            }).join('');
+
+            document.getElementById('adminParcelsBody').innerHTML = db.orders.map(o => {
+                const delivered = o.status === 'delivered';
+                return `
+                    <tr>
+                        <td><strong>${esc(o.parcel_code)}</strong></td>
+                        <td>${esc(o.store_name)}</td>
+                        <td>${esc(o.product_title)} × ${o.qty}</td>
+                        <td>${esc(o.tracking_number)}</td>
+                        <td><span class="badge ${delivered ? 'b-delivered' : 'b-held'}">${delivered ? 'Livré' : 'Non livré'}</span></td>
+                        <td>${o.payout_released ? 'Versé' : delivered ? 'Débloqué' : 'Bloqué'}</td>
+                        <td style="display:flex;gap:6px;">
+                            <button class="btn-dark" onclick="openTracking(${o.id})">Suivi</button>
+                            ${!delivered ? `<button class="btn-green" onclick="confirmDeliveryAdmin(${o.id})">Confirmer Livraison</button>` : ''}
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function openTracking(orderId) {
+            const o = db.orders.find(x => x.id === orderId);
+            if (!o) return;
+            document.getElementById('trackModalTitle').innerText = `Suivi ${o.parcel_code} — ${o.product_title}`;
+            document.getElementById('trackModalBody').innerHTML = `
+                <p style="font-size:13px;margin-bottom:10px;">
+                    <strong>Destination :</strong> ${esc(o.buyer_city)} • <strong>Suivi :</strong> ${esc(o.tracking_number)}
+                </p>
+                ${(o.timeline || []).map(t => `
+                    <div class="step-line"><strong>${esc(t.step_title)}</strong><br><span>${esc(t.detail)}</span></div>
+                `).join('')}
+            `;
+            document.getElementById('trackModal').classList.add('open');
+        }
+
+        function renderConversations() {
+            if (!activeConvId && db.conversations.length) activeConvId = db.conversations[0].id;
+            document.getElementById('convList').innerHTML = db.conversations.map(c => `
+                <div class="conv-item ${c.id === activeConvId ? 'active' : ''}" onclick="activeConvId=${c.id};renderConversations();">
+                    <strong>${esc(c.store_name)}</strong><br>
+                    <small>${esc(c.product_title)} (${esc(c.parcel_code)})</small>
+                </div>
+            `).join('');
+
+            const conv = db.conversations.find(c => c.id === activeConvId);
+            const flagBtn = document.getElementById('flagConvBtn');
+            if (!conv) {
+                document.getElementById('activeConvLabel').innerText = 'Aucune discussion';
+                document.getElementById('chatMsgs').innerHTML = '';
+                flagBtn.style.display = 'none';
+                return;
+            }
+            document.getElementById('activeConvLabel').innerText = `${conv.store_name} — ${conv.parcel_code}` + (conv.flagged ? ' [Signalé]' : '');
+            flagBtn.style.display = 'inline-block';
+
+            const me = currentRole === 'seller' ? 'Vendeur' : currentRole === 'admin' ? db.adminName : 'Acheteur';
+            document.getElementById('chatMsgs').innerHTML = (conv.messages || []).map(m => `
+                <div class="bubble ${m.sender_label === me ? 'me' : 'other'}">
+                    <div>${esc(m.body)}</div>
+                    <small style="opacity:0.7;font-size:10px;">${esc(m.sender_label)}</small>
+                </div>
+            `).join('');
+        }
+
+        async function sendChatMsg(e) {
+            e.preventDefault();
+            if (!activeConvId) return;
+            const senderLabel = currentRole === 'seller' ? 'Vendeur' : currentRole === 'admin' ? db.adminName : 'Acheteur';
+            const input = document.getElementById('chatInput');
+            await fetch(`${API_URL}/conversations/${activeConvId}/messages`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ senderLabel, body: input.value })
+            });
+            input.value = '';
+            await syncFromServer();
+        }
+
+        async function flagCurrentConv() {
+            if (!activeConvId) return;
+            await fetch(`${API_URL}/conversations/${activeConvId}/flag`, { method: 'POST' });
+            alert(`Signalé à ${db.adminName}.`);
+            await syncFromServer();
+        }
+
+        async function submitSupportTicket(e) {
+            e.preventDefault();
+            const res = await fetch(`${API_URL}/support`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    parcelCode: document.getElementById('ticketParcelId').value,
+                    ticketType: document.getElementById('ticketType').value,
+                    description: document.getElementById('ticketDesc').value
+                })
+            });
+            const data = await res.json();
+            if (!res.ok) return alert(data.error);
+            document.getElementById('supportLiveBox').innerHTML = `<div class="notice-box"><strong>Réponse active :</strong><br>${esc(data.reply)}</div>`;
+            e.target.reset();
+            await syncFromServer();
+        }
+
+        function renderTickets() {
+            document.getElementById('ticketsHistory').innerHTML = db.tickets.map(t => `
+                <div style="padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;">
+                    <strong>#${t.id} (${esc(t.parcel_code)})</strong> : ${esc(t.description)}
+                    <div class="notice-box">${esc(t.reply)}</div>
+                </div>
+            `).join('');
+        }
+
+        function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+        function esc(s) { return String(s || '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
+
+        function refreshAllViews() {
+            updateCartBadge();
+            renderMarket();
+            renderSellerView();
+            renderAdminView();
+            renderConversations();
+            renderTickets();
+        }
+
+        syncFromServer();
+    </script>
+</body>
+</html>

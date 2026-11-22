@@ -1,0 +1,6 @@
+{
+  "name": "Yama Shop",
+  "description": "Plateforme internationale e-commerce et dropshipping avec gestion multi-devises, suivi de colis en temps réel et paiements sécurisés sous séquestre.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
