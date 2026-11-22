@@ -9,6 +9,7 @@ import { CartDrawer, type CartItem } from './components/CartDrawer.tsx';
 import { TrackingModal } from './components/TrackingModal.tsx';
 import { ProductModal } from './components/ProductModal.tsx';
 import { applyLiveRates } from './lib/currency.ts';
+import { apiRequest, isDemoMode } from './lib/api.ts';
 import type {
   AppTab,
   CurrencyCode,
@@ -30,6 +31,7 @@ export default function App() {
   const [state, setState] = useState<PlatformState | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [demoMode, setDemoMode] = useState(false);
 
   const [activeTab, setActiveTab] = useState<AppTab>('market');
   const [currency, setCurrency] = useState<CurrencyCode>(() => {
@@ -71,11 +73,19 @@ export default function App() {
     }, 3500);
   }, []);
 
+  const request = useCallback(
+    async (path: string, options?: Parameters<typeof apiRequest>[1]) => {
+      const res = await apiRequest(path, options);
+      if (res.demo) setDemoMode(true);
+      if (!res.ok) throw new Error(res.data?.error || 'Action impossible.');
+      return res.data;
+    },
+    []
+  );
+
   const fetchPlatformState = useCallback(async () => {
     try {
-      const res = await fetch('/api/state');
-      if (!res.ok) throw new Error('Impossible de charger les données de Yama Shop.');
-      const data = (await res.json()) as PlatformState;
+      const data = (await request('/api/state')) as PlatformState;
       setState(data);
       setLoadError(null);
     } catch (err: unknown) {
@@ -83,14 +93,14 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [request]);
 
   const fetchLiveRates = useCallback(async (force = false) => {
     setRefreshingRates(true);
     try {
-      const res = await fetch(force ? '/api/rates?refresh=1' : '/api/rates');
+      const res = await apiRequest<ExchangeRatesResponse>(force ? '/api/rates?refresh=1' : '/api/rates');
       if (!res.ok) return;
-      const data = (await res.json()) as ExchangeRatesResponse;
+      const data = res.data;
       applyLiveRates(data.rates);
       setRatesSource(data.source);
       setRatesUpdatedAt(data.updatedAt);
@@ -104,16 +114,21 @@ export default function App() {
   useEffect(() => {
     fetchPlatformState();
     fetchLiveRates(false);
+  }, [fetchPlatformState, fetchLiveRates]);
 
+  useEffect(() => {
+    if (demoMode || typeof EventSource === 'undefined') return;
     const eventSource = new EventSource('/api/events');
     eventSource.addEventListener('state_updated', () => {
       fetchPlatformState();
     });
-
+    eventSource.onerror = () => {
+      if (isDemoMode()) eventSource.close();
+    };
     return () => {
       eventSource.close();
     };
-  }, [fetchPlatformState, fetchLiveRates]);
+  }, [demoMode, fetchPlatformState]);
 
   // Automatic periodic exchange rate synchronization when enabled
   useEffect(() => {
@@ -198,18 +213,15 @@ export default function App() {
     buyerCity: string;
     paymentMethod: string;
   }) => {
-    const res = await fetch('/api/orders', {
+    const data = await request('/api/orders', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body: {
         items: cart,
         buyerCity: payload.buyerCity,
         paymentCurrency: currency,
         paymentMethod: payload.paymentMethod,
-      }),
+      },
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Échec de validation de la commande.');
     setCart([]);
     await fetchPlatformState();
     return { parcelCodes: data.parcelCodes as string[] };
@@ -232,13 +244,7 @@ export default function App() {
   };
 
   const handleSaveStore = async (name: string, logistics: LogisticsModel) => {
-    const res = await fetch('/api/stores', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, logistics }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    await request('/api/stores', { method: 'POST', body: { name, logistics } });
     await fetchPlatformState();
   };
 
@@ -252,24 +258,12 @@ export default function App() {
     origin: string;
     description: string;
   }) => {
-    const res = await fetch('/api/products', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    await request('/api/products', { method: 'POST', body: payload });
     await fetchPlatformState();
   };
 
   const handleShipOrder = async (orderId: number, trackingNumber: string) => {
-    const res = await fetch(`/api/orders/${orderId}/ship`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ trackingNumber }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    await request(`/api/orders/${orderId}/ship`, { method: 'PATCH', body: { trackingNumber } });
     await fetchPlatformState();
   };
 
@@ -277,20 +271,12 @@ export default function App() {
     orderId: number,
     payload: { stepTitle: string; location: string; detail: string }
   ) => {
-    const res = await fetch(`/api/orders/${orderId}/transit`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    await request(`/api/orders/${orderId}/transit`, { method: 'PATCH', body: payload });
     await fetchPlatformState();
   };
 
   const handleClaimPayout = async (orderId: number) => {
-    const res = await fetch(`/api/orders/${orderId}/payout`, { method: 'POST' });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    await request(`/api/orders/${orderId}/payout`, { method: 'POST' });
     await fetchPlatformState();
   };
 
@@ -299,21 +285,20 @@ export default function App() {
     senderLabel: string,
     body: string
   ) => {
-    const res = await fetch(`/api/conversations/${convId}/messages`, {
+    await request(`/api/conversations/${convId}/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ senderLabel, body }),
+      body: { senderLabel, body },
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
     await fetchPlatformState();
   };
 
   const handleFlagConversation = async (convId: number) => {
-    const res = await fetch(`/api/conversations/${convId}/flag`, { method: 'POST' });
-    if (res.ok) {
+    try {
+      await request(`/api/conversations/${convId}/flag`, { method: 'POST' });
       showToast(`Discussion signalée à ${state?.adminName || 'Koukoum Junior'}.`);
       await fetchPlatformState();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Signalement impossible.', 'error');
     }
   };
 
@@ -322,54 +307,36 @@ export default function App() {
     ticketType: SupportTicketType;
     description: string;
   }): Promise<SupportTicket> => {
-    const res = await fetch('/api/support', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    const data = await request('/api/support', { method: 'POST', body: payload });
     await fetchPlatformState();
     return data as SupportTicket;
   };
 
   const handleUnlockAdmin = async (pin: string): Promise<boolean> => {
-    const res = await fetch('/api/admin/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pin }),
-    });
+    const res = await apiRequest('/api/admin/verify', { method: 'POST', body: { pin } });
+    if (res.demo) setDemoMode(true);
     if (!res.ok) return false;
     setAdminPin(pin);
     setRole('admin');
     return true;
   };
 
+  const adminHeaders = { 'x-role': 'admin', 'x-admin-pin': adminPin };
+
   const handleConfirmDelivery = async (orderId: number) => {
-    const res = await fetch(`/api/admin/orders/${orderId}/deliver`, {
+    await request(`/api/admin/orders/${orderId}/deliver`, {
       method: 'PATCH',
-      headers: {
-        'x-role': 'admin',
-        'x-admin-pin': adminPin,
-      },
+      headers: adminHeaders,
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
     await fetchPlatformState();
   };
 
   const handleUpdateCommission = async (storeId: number, pct: number) => {
-    const res = await fetch(`/api/admin/stores/${storeId}/commission`, {
+    await request(`/api/admin/stores/${storeId}/commission`, {
       method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-role': 'admin',
-        'x-admin-pin': adminPin,
-      },
-      body: JSON.stringify({ commissionPct: pct }),
+      headers: adminHeaders,
+      body: { commissionPct: pct },
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
     await fetchPlatformState();
   };
 
@@ -407,6 +374,15 @@ export default function App() {
         onOpenCart={() => setCartOpen(true)}
         onQuickTrack={handleQuickTrack}
       />
+
+      {demoMode && (
+        <div role="status" className="bg-amber-50 border-b border-amber-200 text-amber-900 text-xs">
+          <p className="max-w-[1360px] mx-auto px-6 py-2">
+            <strong>Mode démo</strong> · Serveur indisponible : produits de démonstration chargés, vos actions sont
+            enregistrées localement dans ce navigateur.
+          </p>
+        </div>
+      )}
 
       <main className="flex-1 max-w-[1360px] w-full mx-auto px-6 py-8">
         {loading && !state ? (
